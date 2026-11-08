@@ -59,7 +59,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 MONTHLY_CONTRIBUTION = 100
-ADMIN_PIN = "1234"  # Tum apna pasandida 4-digit PIN yahan rakh sakte ho
+ADMIN_PIN = "1234"
 
 # --- DATABASE SETUP (LOCAL SQLITE) ---
 DB_NAME = "cricket_funds.db"
@@ -87,7 +87,7 @@ def init_db():
             month_year TEXT,
             paid_status INTEGER DEFAULT 0,
             PRIMARY KEY (player_id, month_year),
-            FOREIGN KEY (player_id) REFERENCES players(id)
+            FOREIGN KEY (player_id) REFERENCES players(id) ON DELETE CASCADE
         )
     """)
     
@@ -100,8 +100,19 @@ def init_db():
             date TEXT NOT NULL
         )
     """)
+
+    # 4. Extra Funds / Donations Table
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS extra_funds (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            donor_name TEXT NOT NULL,
+            amount REAL NOT NULL,
+            date TEXT NOT NULL,
+            notes TEXT
+        )
+    """)
     
-    # Pre-seed Core 16 Players
+    # Pre-seed Core Players
     squad = [
         "Aryan", "Anik", "Santanu", "Dipta", "Kankan", "Rony", "Rohit", "Banty",
         "Vivek", "Abhishek", "Joydeep", "Alto", "Pinaki", "Gulan da", "Ayan da", "Abhirup"
@@ -121,11 +132,11 @@ def get_month_options():
     cur_month = now.month
     
     options = []
-    # 1. Baseline: 05-2026 to 12-2026
+    # Baseline: 05-2026 to 12-2026
     for m in range(5, 13):
         options.append(f"{m:02d}-2026")
         
-    # 2. Future 6-month block unlocking
+    # Future 6-month block unlocking
     for y in range(2027, cur_year + 1):
         if y == cur_year:
             if cur_month >= 1:
@@ -138,13 +149,11 @@ def get_month_options():
             for m in range(1, 13):
                 options.append(f"{m:02d}-{y}")
                 
-    options.reverse()  # Newest month on top
+    options.reverse()
     return options
 
 month_options = get_month_options()
 current_month_str = datetime.now().strftime("%m-%Y")
-
-# Default index handling
 default_idx = month_options.index(current_month_str) if current_month_str in month_options else 0
 
 # --- HEADER SECTION ---
@@ -178,13 +187,22 @@ df_expenses = pd.read_sql_query("""
     ORDER BY id DESC
 """, conn)
 
-# Overall Lifetime math
+df_extra = pd.read_sql_query("""
+    SELECT id, donor_name as 'Source / Donor', amount as 'Amount (₹)', date as 'Date', notes as 'Remarks'
+    FROM extra_funds
+    ORDER BY id DESC
+""", conn)
+
+# Lifetime calculations
 c.execute("SELECT SUM(paid_status) FROM payments")
 total_paid_units = c.fetchone()[0] or 0
 total_collected_lifetime = total_paid_units * MONTHLY_CONTRIBUTION
 
 c.execute("SELECT SUM(amount) FROM expenses")
 total_spent_lifetime = c.fetchone()[0] or 0.0
+
+c.execute("SELECT SUM(amount) FROM extra_funds")
+total_extra_funds = c.fetchone()[0] or 0.0
 
 conn.close()
 
@@ -194,7 +212,7 @@ paid_count = int(df_payments['paid'].sum())
 pending_count = total_players - paid_count
 collected_this_month = paid_count * MONTHLY_CONTRIBUTION
 pending_this_month = pending_count * MONTHLY_CONTRIBUTION
-treasury_balance = total_collected_lifetime - total_spent_lifetime
+treasury_balance = (total_collected_lifetime + total_extra_funds) - total_spent_lifetime
 
 # --- TOP METRIC CARDS ---
 m1, m2, m3, m4 = st.columns(4)
@@ -219,10 +237,10 @@ with m2:
 
 with m3:
     st.markdown(f"""
-        <div class="metric-card" style="border-left-color: #f43f5e;">
-            <p>Pending Dues</p>
-            <h3>₹{pending_this_month}</h3>
-            <small>{pending_count} Players Left</small>
+        <div class="metric-card" style="border-left-color: #f59e0b;">
+            <p>Extra Funds / Donations</p>
+            <h3>₹{int(total_extra_funds)}</h3>
+            <small>External Contributions</small>
         </div>
     """, unsafe_allow_html=True)
 
@@ -236,12 +254,15 @@ with m4:
     """, unsafe_allow_html=True)
 
 # --- MAIN TABS ---
-tab_roster, tab_exp, tab_admin = st.tabs(["🏏 Scoreboard / Roster", "🧾 Expenses", "🔐 Admin Console"])
+tab_roster, tab_exp, tab_extra, tab_admin = st.tabs([
+    "🏏 Scoreboard / Roster", 
+    "🧾 Expenses", 
+    "🎁 Extra Funds", 
+    "🔐 Admin Console"
+])
 
 with tab_roster:
     st.subheader(f"Payment Status for {selected_month}")
-    
-    # Clean UI representation
     display_df = df_payments.copy()
     display_df['Status'] = display_df['paid'].apply(lambda x: "🟢 PAID (₹100)" if x == 1 else "🔴 PENDING")
     
@@ -258,8 +279,7 @@ with tab_roster:
             pct = (paid_count / total_players)
             st.progress(pct)
             st.write(f"**{int(pct * 100)}% Collected** for this month.")
-        
-        st.info("Tip: Any player who hasn't paid will show as PENDING until marked by the admin.")
+            st.write(f"Pending Dues: **₹{pending_this_month}**")
 
 with tab_exp:
     st.subheader("Equipment & Match Expenditure")
@@ -268,6 +288,13 @@ with tab_exp:
     else:
         st.dataframe(df_expenses[['Item / Particulars', 'Amount (₹)', 'Date']], use_container_width=True, hide_index=True)
 
+with tab_extra:
+    st.subheader("External Contributions & Uncle Donations")
+    if df_extra.empty:
+        st.info("No external donations logged yet.")
+    else:
+        st.dataframe(df_extra[['Source / Donor', 'Amount (₹)', 'Date', 'Remarks']], use_container_width=True, hide_index=True)
+
 with tab_admin:
     st.subheader("Admin Control Center")
     admin_pin = st.text_input("Enter 4-Digit Admin PIN", type="password", key="admin_pin_input")
@@ -275,15 +302,23 @@ with tab_admin:
     if admin_pin == ADMIN_PIN:
         st.success("Authorized. You can modify records below.")
         
-        admin_mode = st.radio("Choose Action", ["Update Member Payments", "Log New Expense", "Add New Member to Squad"], horizontal=True)
+        admin_mode = st.radio(
+            "Choose Action", 
+            [
+                "Update Member Payments", 
+                "Log Extra Fund / Donation", 
+                "Log New Expense", 
+                "Add New Member", 
+                "Delete / Remove Member"
+            ], 
+            horizontal=True
+        )
         
         conn = get_db()
         c = conn.cursor()
         
         if admin_mode == "Update Member Payments":
             st.write(f"#### Check off members who paid for **{selected_month}**:")
-            
-            # 2 Columns of checkboxes for clean layout
             cols = st.columns(2)
             updated_vals = {}
             for i, row in df_payments.iterrows():
@@ -303,11 +338,33 @@ with tab_admin:
                 st.toast("Payments updated successfully!")
                 st.rerun()
                 
+        elif admin_mode == "Log Extra Fund / Donation":
+            st.write("#### Add Extra Income / Donor Contribution:")
+            c_f1, c_f2 = st.columns([2, 1])
+            with c_f1:
+                donor_name = st.text_input("Donor / Source (e.g., Sharma Uncle, Tournament Cash Prize)")
+                donor_notes = st.text_input("Remarks / Notes (Optional, e.g., For match refreshments)")
+            with c_f2:
+                donation_amt = st.number_input("Amount (₹)", min_value=0.0, step=50.0)
+                
+            if st.button("🎁 Deposit Extra Fund", type="primary"):
+                if donor_name.strip() and donation_amt > 0:
+                    today = datetime.now().strftime("%d-%b-%Y")
+                    c.execute(
+                        "INSERT INTO extra_funds (donor_name, amount, date, notes) VALUES (?, ?, ?, ?)",
+                        (donor_name.strip(), donation_amt, today, donor_notes.strip())
+                    )
+                    conn.commit()
+                    st.toast(f"Added ₹{donation_amt} from {donor_name} to Treasury!")
+                    st.rerun()
+                else:
+                    st.error("Please enter a valid donor name and amount.")
+
         elif admin_mode == "Log New Expense":
             st.write("#### Debit Cash from Treasury:")
             c_e1, c_e2 = st.columns([2, 1])
             with c_e1:
-                item_name = st.text_input("Item Description (e.g., 2 Vicky Tennis Balls, Crepe Tape)")
+                item_name = st.text_input("Item Description (e.g., 2 Vicky Tennis Balls)")
             with c_e2:
                 item_price = st.number_input("Amount (₹)", min_value=0.0, step=10.0)
                 
@@ -321,7 +378,7 @@ with tab_admin:
                 else:
                     st.error("Please enter a valid item name and amount.")
                     
-        elif admin_mode == "Add New Member to Squad":
+        elif admin_mode == "Add New Member":
             st.write("#### Add a Permanent Squad Member:")
             new_member = st.text_input("Member Full Name")
             if st.button("➕ Add Member", type="primary"):
@@ -336,6 +393,29 @@ with tab_admin:
                 else:
                     st.error("Name cannot be empty.")
                     
+        elif admin_mode == "Delete / Remove Member":
+            st.write("#### Remove an Inactive / Exited Player:")
+            c.execute("SELECT id, name FROM players ORDER BY name ASC")
+            all_players = c.fetchall()
+            
+            if all_players:
+                player_dict = {name: pid for pid, name in all_players}
+                player_to_remove = st.selectbox("Select Player to Delete", list(player_dict.keys()))
+                
+                confirm = st.checkbox(f"Yes, remove '{player_to_remove}' permanently from squad")
+                if st.button("🗑️ Remove Player", type="primary"):
+                    if confirm:
+                        pid = player_dict[player_to_remove]
+                        c.execute("DELETE FROM payments WHERE player_id = ?", (pid,))
+                        c.execute("DELETE FROM players WHERE id = ?", (pid,))
+                        conn.commit()
+                        st.toast(f"{player_to_remove} has been removed.")
+                        st.rerun()
+                    else:
+                        st.warning("Please tick the confirmation checkbox first.")
+            else:
+                st.info("No players left in roster.")
+
         conn.close()
     elif admin_pin != "":
         st.error("Incorrect PIN. Modifications locked.")
