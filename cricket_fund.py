@@ -1,6 +1,6 @@
 import streamlit as st
 import pandas as pd
-import sqlite3
+import psycopg2
 from datetime import datetime
 
 # --- PAGE SETUP & FUTURISTIC THEME ---
@@ -61,12 +61,9 @@ st.markdown("""
 MONTHLY_CONTRIBUTION = 100
 ADMIN_PIN = "1234"
 
-# --- DATABASE SETUP (LOCAL SQLITE) ---
-DB_NAME = "cricket_funds.db"
-
+# --- DATABASE SETUP (CLOUD POSTGRESQL) ---
 def get_db():
-    conn = sqlite3.connect(DB_NAME)
-    return conn
+    return psycopg2.connect(st.secrets["DATABASE_URL"])
 
 def init_db():
     conn = get_db()
@@ -75,7 +72,7 @@ def init_db():
     # 1. Players Table
     c.execute("""
         CREATE TABLE IF NOT EXISTS players (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             name TEXT UNIQUE NOT NULL
         )
     """)
@@ -83,18 +80,17 @@ def init_db():
     # 2. Payments Table
     c.execute("""
         CREATE TABLE IF NOT EXISTS payments (
-            player_id INTEGER,
+            player_id INTEGER REFERENCES players(id) ON DELETE CASCADE,
             month_year TEXT,
             paid_status INTEGER DEFAULT 0,
-            PRIMARY KEY (player_id, month_year),
-            FOREIGN KEY (player_id) REFERENCES players(id) ON DELETE CASCADE
+            PRIMARY KEY (player_id, month_year)
         )
     """)
     
     # 3. Expenses Table
     c.execute("""
         CREATE TABLE IF NOT EXISTS expenses (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             item TEXT NOT NULL,
             amount REAL NOT NULL,
             date TEXT NOT NULL
@@ -104,7 +100,7 @@ def init_db():
     # 4. Extra Funds / Donations Table
     c.execute("""
         CREATE TABLE IF NOT EXISTS extra_funds (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             donor_name TEXT NOT NULL,
             amount REAL NOT NULL,
             date TEXT NOT NULL,
@@ -112,18 +108,23 @@ def init_db():
         )
     """)
     
-    # Pre-seed Core Players
-    squad = [
-        "Aryan", "Anik", "Santanu", "Dipta", "Kankan", "Rony", "Rohit", "Banty",
-        "Vivek", "Akash", "Joydeep", "Alto", "Pinaki", "Gulan da", "Ayan da", "Abhirup"
-    ]
-    for p in squad:
-        c.execute("INSERT OR IGNORE INTO players (name) VALUES (?)", (p,))
+    # Seed initial players ONLY IF table is completely empty (Fixes delete bug)
+    c.execute("SELECT COUNT(*) FROM players")
+    if c.fetchone()[0] == 0:
+        squad = [
+            "Aryan", "Anik", "Santanu", "Dipta", "Kankan", "Rony", "Rohit", "Banty",
+            "Vivek", "Abhishek", "Joydeep", "Alto", "Pinaki", "Gulan da", "Ayan da", "Abhirup"
+        ]
+        for p in squad:
+            c.execute("INSERT INTO players (name) VALUES (%s) ON CONFLICT (name) DO NOTHING", (p,))
         
     conn.commit()
     conn.close()
 
-init_db()
+# Initialize DB once per session
+if "db_initialized" not in st.session_state:
+    init_db()
+    st.session_state.db_initialized = True
 
 # --- DYNAMIC 6-MONTH BLOCK GENERATION ---
 def get_month_options():
@@ -160,7 +161,7 @@ default_idx = month_options.index(current_month_str) if current_month_str in mon
 col_head, col_sel = st.columns([3, 1])
 with col_head:
     st.title("⚡ CRICKET SQUAD TREASURY")
-    st.caption("Local High-Performance Ledger & Expense Engine")
+    st.caption("Cloud PostgreSQL Ledger & Expense Engine")
 with col_sel:
     selected_month = st.selectbox("📅 Target Month", month_options, index=default_idx)
 
@@ -170,25 +171,29 @@ c = conn.cursor()
 c.execute("SELECT id FROM players")
 player_ids = [row[0] for row in c.fetchall()]
 for pid in player_ids:
-    c.execute("INSERT OR IGNORE INTO payments (player_id, month_year, paid_status) VALUES (?, ?, 0)", (pid, selected_month))
+    c.execute("""
+        INSERT INTO payments (player_id, month_year, paid_status) 
+        VALUES (%s, %s, 0) 
+        ON CONFLICT (player_id, month_year) DO NOTHING
+    """, (pid, selected_month))
 conn.commit()
 
 # --- RETRIEVE DATA ---
-df_payments = pd.read_sql_query(f"""
+df_payments = pd.read_sql_query("""
     SELECT p.id, p.name, COALESCE(pm.paid_status, 0) as paid
     FROM players p
-    LEFT JOIN payments pm ON p.id = pm.player_id AND pm.month_year = '{selected_month}'
+    LEFT JOIN payments pm ON p.id = pm.player_id AND pm.month_year = %s
     ORDER BY p.name ASC
-""", conn)
+""", conn, params=(selected_month,))
 
 df_expenses = pd.read_sql_query("""
-    SELECT id, item as 'Item / Particulars', amount as 'Amount (₹)', date as 'Date' 
+    SELECT id, item as "Item / Particulars", amount as "Amount (₹)", date as "Date" 
     FROM expenses 
     ORDER BY id DESC
 """, conn)
 
 df_extra = pd.read_sql_query("""
-    SELECT id, donor_name as 'Source / Donor', amount as 'Amount (₹)', date as 'Date', notes as 'Remarks'
+    SELECT id, donor_name as "Source / Donor", amount as "Amount (₹)", date as "Date", notes as "Remarks"
     FROM extra_funds
     ORDER BY id DESC
 """, conn)
@@ -208,7 +213,7 @@ conn.close()
 
 # Month-specific Math
 total_players = len(df_payments)
-paid_count = int(df_payments['paid'].sum())
+paid_count = int(df_payments['paid'].sum()) if total_players > 0 else 0
 pending_count = total_players - paid_count
 collected_this_month = paid_count * MONTHLY_CONTRIBUTION
 pending_this_month = pending_count * MONTHLY_CONTRIBUTION
@@ -263,23 +268,26 @@ tab_roster, tab_exp, tab_extra, tab_admin = st.tabs([
 
 with tab_roster:
     st.subheader(f"Payment Status for {selected_month}")
-    display_df = df_payments.copy()
-    display_df['Status'] = display_df['paid'].apply(lambda x: "🟢 PAID (₹100)" if x == 1 else "🔴 PENDING")
-    
-    col_t1, col_t2 = st.columns([2, 1])
-    with col_t1:
-        st.dataframe(
-            display_df[['name', 'Status']].rename(columns={'name': 'Player'}),
-            use_container_width=True,
-            hide_index=True
-        )
-    with col_t2:
-        st.markdown("#### Squad Summary")
-        if total_players > 0:
-            pct = (paid_count / total_players)
-            st.progress(pct)
-            st.write(f"**{int(pct * 100)}% Collected** for this month.")
-            st.write(f"Pending Dues: **₹{pending_this_month}**")
+    if df_payments.empty:
+        st.info("No players in roster. Add members from Admin Console.")
+    else:
+        display_df = df_payments.copy()
+        display_df['Status'] = display_df['paid'].apply(lambda x: "🟢 PAID (₹100)" if x == 1 else "🔴 PENDING")
+        
+        col_t1, col_t2 = st.columns([2, 1])
+        with col_t1:
+            st.dataframe(
+                display_df[['name', 'Status']].rename(columns={'name': 'Player'}),
+                use_container_width=True,
+                hide_index=True
+            )
+        with col_t2:
+            st.markdown("#### Squad Summary")
+            if total_players > 0:
+                pct = (paid_count / total_players)
+                st.progress(pct)
+                st.write(f"**{int(pct * 100)}% Collected** for this month.")
+                st.write(f"Pending Dues: **₹{pending_this_month}**")
 
 with tab_exp:
     st.subheader("Equipment & Match Expenditure")
@@ -331,8 +339,8 @@ with tab_admin:
                 for pid, status in updated_vals.items():
                     c.execute("""
                         UPDATE payments 
-                        SET paid_status = ? 
-                        WHERE player_id = ? AND month_year = ?
+                        SET paid_status = %s 
+                        WHERE player_id = %s AND month_year = %s
                     """, (status, pid, selected_month))
                 conn.commit()
                 st.toast("Payments updated successfully!")
@@ -351,7 +359,7 @@ with tab_admin:
                 if donor_name.strip() and donation_amt > 0:
                     today = datetime.now().strftime("%d-%b-%Y")
                     c.execute(
-                        "INSERT INTO extra_funds (donor_name, amount, date, notes) VALUES (?, ?, ?, ?)",
+                        "INSERT INTO extra_funds (donor_name, amount, date, notes) VALUES (%s, %s, %s, %s)",
                         (donor_name.strip(), donation_amt, today, donor_notes.strip())
                     )
                     conn.commit()
@@ -371,7 +379,7 @@ with tab_admin:
             if st.button("💸 Record Expense", type="primary"):
                 if item_name and item_price > 0:
                     today = datetime.now().strftime("%d-%b-%Y")
-                    c.execute("INSERT INTO expenses (item, amount, date) VALUES (?, ?, ?)", (item_name, item_price, today))
+                    c.execute("INSERT INTO expenses (item, amount, date) VALUES (%s, %s, %s)", (item_name, item_price, today))
                     conn.commit()
                     st.toast(f"Logged ₹{item_price} for {item_name}")
                     st.rerun()
@@ -384,11 +392,12 @@ with tab_admin:
             if st.button("➕ Add Member", type="primary"):
                 if new_member.strip():
                     try:
-                        c.execute("INSERT INTO players (name) VALUES (?)", (new_member.strip(),))
+                        c.execute("INSERT INTO players (name) VALUES (%s)", (new_member.strip(),))
                         conn.commit()
                         st.toast(f"{new_member} added to squad!")
                         st.rerun()
-                    except sqlite3.IntegrityError:
+                    except psycopg2.IntegrityError:
+                        conn.rollback()
                         st.error("This player is already in the roster.")
                 else:
                     st.error("Name cannot be empty.")
@@ -406,8 +415,8 @@ with tab_admin:
                 if st.button("🗑️ Remove Player", type="primary"):
                     if confirm:
                         pid = player_dict[player_to_remove]
-                        c.execute("DELETE FROM payments WHERE player_id = ?", (pid,))
-                        c.execute("DELETE FROM players WHERE id = ?", (pid,))
+                        c.execute("DELETE FROM payments WHERE player_id = %s", (pid,))
+                        c.execute("DELETE FROM players WHERE id = %s", (pid,))
                         conn.commit()
                         st.toast(f"{player_to_remove} has been removed.")
                         st.rerun()
