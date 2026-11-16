@@ -115,7 +115,7 @@ def init_db():
     # Pre-seed Core Players
     squad = [
         "Aryan", "Anik", "Santanu", "Dipta", "Kankan", "Rony", "Rohit", "Banty",
-        "Vivek", "Abhishek", "Joydeep", "Alto", "Pinaki", "Gulan da", "Ayan da", "Abhirup"
+        "Vivek", "Akash", "Joydeep", "Alto", "Pinaki", "Gulan da", "Ayan da", "Abhirup"
     ]
     for p in squad:
         c.execute("INSERT OR IGNORE INTO players (name) VALUES (?)", (p,))
